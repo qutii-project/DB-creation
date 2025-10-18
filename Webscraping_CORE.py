@@ -1,52 +1,93 @@
 import requests
 import pandas as pd
+import asyncio
+from playwright.async_api import async_playwright
 import time
 
 API_KEY = ""
-BASE_URL = "https://api.core.ac.uk/v3/search/works"
-QUERY = "all"            # Broad query to cover all topics
-LIMIT = 100              # Maximum results per page
-MAX_PAGES = 200          # Adjust according to the estimated token usage
-DELAY = 1                # Seconds to wait between requests (avoid throttling)
+CORE_BASE_URL = "https://api.core.ac.uk/v3/search/works"
+JOURNAL_NAME = "Sustainability"
+LIMIT = 100
+MAX_PAGES = 100       
+DELAY = 1             # Delay between requests to avoid rate limits
+OUTPUT_FILE = "sustainability_authors_emails.xlsx"
 
-all_topics = set()
+all_articles = []
 
 for page in range(1, MAX_PAGES + 1):
-    print(f"Fetching page {page}...")
+    print(f"Fetching CORE page {page}...")
     params = {
-        "q": QUERY,
+        "q": f'source.name:"{JOURNAL_NAME}" AND year:>=2020',
         "limit": LIMIT,
         "page": page,
         "apiKey": API_KEY
     }
 
-    try:
-        response = requests.get(BASE_URL, params=params)
-        if response.status_code != 200:
-            print(f"Error {response.status_code} on page {page}, stopping.")
-            break
-
-        data = response.json()
-        results = data.get("results", [])
-
-        if not results:
-            print("No more results, stopping.")
-            break
-
-        for item in results:
-            topics = item.get("topics", [])
-            for t in topics:
-                all_topics.add(t.strip())
-
-        time.sleep(DELAY)
-
-    except Exception as e:
-        print(f"Exception on page {page}: {e}")
+    resp = requests.get(CORE_BASE_URL, params=params)
+    if resp.status_code != 200:
+        print(f"CORE API error {resp.status_code} on page {page}")
         break
 
-unique_topics = sorted(all_topics)
+    data = resp.json()
+    results = data.get("results", [])
+    if not results:
+        print("No more results.")
+        break
 
-# Save to Excel
-df = pd.DataFrame(unique_topics, columns=["Topic"])
-df.to_excel("core_all_topics.xlsx", index=False)
-print(f"Extraction complete! {len(unique_topics)} unique topics saved to core_all_topics.xlsx")
+    for item in results:
+        authors = item.get("authors", [])
+        first_author = authors[0]["name"] if authors else ""
+        all_articles.append({
+            "Journal": item.get("source", {}).get("name", ""),
+            "Title": item.get("title", ""),
+            "Full Name": first_author,
+            "DOI": item.get("doi", ""),
+            "URL": item.get("links", [{}])[0].get("url", ""),
+            "Topics": ', '.join(item.get("topics", []))
+        })
+
+    time.sleep(DELAY)
+
+# Scrape main author emails
+async def scrape_emails(articles):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+
+        for article in articles:
+            url = article["URL"]
+            email = ""
+            try:
+                await page.goto(url, timeout=120000)
+                await page.wait_for_load_state("networkidle")
+
+               
+                # Publisher-specific selectors
+                if "mdpi.com" in url:
+                    email_elem = await page.query_selector("a.toEncode.emailCaptcha")
+                    email = email_elem.get_attribute("href") if email_elem else ""
+                elif "wiley.com" in url:
+                    email_elem = await page.query_selector("a[href^='mailto:']")
+                    email = email_elem.get_attribute("href") if email_elem else ""
+                elif "tandfonline.com" in url:
+                    email_elem = await page.query_selector("a.corresponding-author-email")
+                    email = email_elem.get_attribute("href") if email_elem else ""
+                #---
+
+                email = email.replace("mailto:", "") if email else ""
+                article["Email"] = email
+                print(f"Scraped email for: {article['Full Name']} ({email})")
+
+            except Exception as e:
+                article["Email"] = ""
+                print(f"Error scraping {url}: {e}")
+
+        await browser.close()
+
+# Run scraping
+asyncio.run(scrape_emails(all_articles))
+
+# Step 3: Save to Excel
+df = pd.DataFrame(all_articles)
+df.to_excel(OUTPUT_FILE, index=False)
+print(f"Saved {len(all_articles)} articles with emails to {OUTPUT_FILE}")
